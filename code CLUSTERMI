@@ -1,0 +1,279 @@
+# 📦 Chargement des packages nécessaires
+
+packages <- c("clusterMI", "clustMixType", "mclust", "dplyr", "ggplot2",
+
+              "purrr", "parallelMap", "mice", "gtools", "fossil", "proxy")
+
+ 
+
+installed <- rownames(installed.packages())
+
+to_install <- setdiff(packages, installed)
+
+if (length(to_install)) install.packages(to_install)
+
+ 
+
+# 📚 Chargement des librairies
+
+library(clusterMI)
+
+library(clustMixType)
+
+library(mclust)
+
+library(dplyr)
+
+library(ggplot2)
+
+library(purrr)
+
+library(parallelMap)
+
+library(mice)
+
+library(gtools)
+
+library(fossil)
+
+library(proxy)
+
+ 
+
+# 📂 Chargement des données
+
+trial_design <- readRDS("repStudy_trial_design.rds")
+
+dat_complete <- readRDS("dat_complete.rds")
+
+dat_incomplete <- readRDS("dat_incomplete.rds")
+
+ 
+
+# 🔎 Filtrage MCAR et MAR
+
+trial_design <- trial_design %>% filter(missing_type %in% c("MCAR", "MAR"))
+
+ 
+
+# 📁 Répertoire de sauvegarde
+
+save_path <- "results_clusterMI/"
+
+if (!dir.exists(save_path)) dir.create(save_path)
+
+ 
+
+# ✅ Agrégation simple par vote majoritaire
+
+aggregate_clusters <- function(cluster_matrix) {
+
+  apply(cluster_matrix, 1, function(row) {
+
+    as.integer(names(sort(table(row), decreasing = TRUE))[1])
+
+  })
+
+}
+
+ 
+
+# 🧩 Fonction principale avec test + traitement direct
+
+par_fun_clusterMI <- function(n, i, save_path = "results_clusterMI/") {
+
+  save_file <- file.path(save_path, paste0("result_n", n, "_i", i, ".rds"))
+
+  if (file.exists(save_file)) return(invisible(NULL))
+
+ 
+
+  data_NA <- dat_incomplete[[n]][[i]]
+
+  data_NA_clean <- data_NA[, !names(data_NA) %in% c("ID", "kpres"), drop = FALSE]
+
+ 
+
+  valid_vars <- sapply(data_NA_clean, function(v) length(unique(na.omit(v))) > 1)
+
+  data_NA_clean <- data_NA_clean[, valid_vars, drop = FALSE]
+
+  if (ncol(data_NA_clean) == 0) return(invisible(NULL))
+
+ 
+
+  k_opt <- dat_complete[[n]][[i]][[2]]
+
+  lambda <- dat_complete[[n]][[i]][[3]]
+
+  trial <- trial_design[n, ]
+
+ 
+
+  # Imputation multiple
+
+  imp_res <- tryCatch({
+
+    clusterMI::imputedata(
+
+      data.na = data_NA_clean,
+
+      method = "FCS-homo",
+
+      bootstrap = TRUE,
+
+      m = 10,
+
+      nb.clust = k_opt
+
+    )
+
+  }, error = function(e) return(NULL))
+
+  if (is.null(imp_res)) return(invisible(NULL))
+
+ 
+
+  # Enregistrement des colonnes qualitatives originales
+
+  types_origin <- sapply(data_NA_clean, class)
+
+  cat_vars <- names(types_origin[types_origin == "factor"])
+
+ 
+
+  # Clustering sur chaque jeu imputé
+
+  clusters_list <- list()
+
+  for (j in seq_along(imp_res$res.imp)) {
+
+    imp_j <- imp_res$res.imp[[j]]
+
+   
+
+    for (v in cat_vars) {
+
+      if (v %in% names(imp_j)) imp_j[[v]] <- as.factor(imp_j[[v]])
+
+    }
+
+   
+
+    factor_ok <- sapply(imp_j, function(v) is.factor(v) && length(unique(v)) > 1)
+
+    if (!any(factor_ok)) next
+
+   
+
+    valid_vars2 <- sapply(imp_j, function(v) length(unique(v)) > 1)
+
+    imp_j <- imp_j[, valid_vars2, drop = FALSE]
+
+   
+
+    kp <- tryCatch({
+
+      clustMixType::kproto(imp_j, k = k_opt, lambda = lambda, nstart = 3, verbose = FALSE)
+
+    }, error = function(e) return(NULL))
+
+   
+
+    if (!is.null(kp)) clusters_list[[length(clusters_list) + 1]] <- kp$cluster
+
+  }
+
+ 
+
+  if (length(clusters_list) < 2) return(invisible(NULL))  # Pas assez d'imputations valides
+
+ 
+
+  clust_mat <- do.call(cbind, clusters_list)
+
+  final_cluster <- aggregate_clusters(clust_mat)
+
+ 
+
+  result <- list(
+
+    trial = trial,
+
+    i = i,
+
+    clusterMI_result = list(
+
+      cluster = final_cluster,
+
+      imputations = length(clusters_list)
+
+    )
+
+  )
+
+ 
+
+  saveRDS(result, save_file)
+
+  return(invisible(result))
+
+}
+
+ 
+
+# ⚙️ Lancement parallèle avec traitement immédiat
+
+parallelStartSocket(cpus = 4)
+
+parallelLibrary("clusterMI", "clustMixType")
+
+parallelExport("dat_incomplete", "dat_complete", "trial_design", "aggregate_clusters", "save_path", "par_fun_clusterMI")
+
+ 
+
+# 🧪 Lignes à traiter
+
+rows_to_process <- 2
+
+ 
+
+batch_size <- 25
+
+job_list <- list()
+
+for (n in rows_to_process) {
+
+  for (i in seq_along(dat_incomplete[[n]])) {
+
+    job_list <- append(job_list, list(list(n = n, i = i)))
+
+  }
+
+}
+
+job_batches <- split(job_list, ceiling(seq_along(job_list) / batch_size))
+
+ 
+
+for (b in seq_along(job_batches)) {
+
+  cat(sprintf("▶ Batch %d/%d : %d jobs\n", b, length(job_batches), length(job_batches[[b]])))
+
+  parallelLapply(job_batches[[b]], function(job) {
+
+    par_fun_clusterMI(n = job$n, i = job$i)
+
+  })
+
+  gc()
+
+  Sys.sleep(2)
+
+}
+
+ 
+
+parallelStop()
+
+cat("✅ Tous les jobs valides ont été testés, traités, et sauvegardés directement.\n")
